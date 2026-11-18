@@ -59,6 +59,12 @@ return [
             'prefix_indexes' => true,
             'strict' => true,
             'engine' => null,
+            'timezone' => '+00:00',
+            // Los casos de uso bloquean (FOR UPDATE) y después leen con SELECT normales.
+            // Con READ COMMITTED cada lectura ve lo último confirmado por quien tuvo el
+            // lock antes, sin depender de cuándo abre su snapshot REPEATABLE READ.
+            // Además evita gap locks, que son la fuente típica de deadlocks.
+            'isolation_level' => env('DB_ISOLATION_LEVEL', 'READ COMMITTED'),
             'options' => extension_loaded('pdo_mysql') ? array_filter([
                 Mysql::ATTR_SSL_CA => env('MYSQL_ATTR_SSL_CA'),
             ], fn ($value) => $value !== null) : [],

@@ -35,7 +35,6 @@ return [
         ],
     ],
 
-
     // Dónde se conecta el navegador de la demo (puede diferir del host interno de Reverb).
     'reverb_client' => [
         'key' => env('REVERB_APP_KEY'),

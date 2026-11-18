@@ -6,6 +6,7 @@ namespace Tests\Feature\Trading;
 
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Testing\TestResponse;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Support\TradingFixtures;
 use Tests\TestCase;
@@ -82,7 +83,7 @@ final class WeeklyTradeLimitTest extends TestCase
         $this->trade($this->ana, $this->bruno)->assertOk();
     }
 
-    private function trade(int $author, int $acceptor): \Illuminate\Testing\TestResponse
+    private function trade(int $author, int $acceptor): TestResponse
     {
         $offerId = $this->postJson('/api/offers', [
             'offered_sticker_id' => $this->messi,

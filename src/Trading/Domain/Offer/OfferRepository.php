@@ -22,6 +22,6 @@ interface OfferRepository
     /** @return list<int> */
     public function idsDueForExpiration(DateTimeImmutable $now, int $limit): array;
 
-    /** Intercambios cerrados entre la pareja (en cualquier dirección) desde $since. */
+    /** Intercambios cerrados entre la pareja (en cualquier dirección) después de $since. */
     public function countTradesBetween(int $userA, int $userB, DateTimeImmutable $since): int;
 }

@@ -42,6 +42,12 @@ return [
             'driver' => 'session',
             'provider' => 'users',
         ],
+
+        // Autenticación simulada: el id de usuario llega en la cabecera X-User-Id.
+        // Ver App\Providers\AppServiceProvider.
+        'api' => [
+            'driver' => 'user-id-header',
+        ],
     ],
 
     /*

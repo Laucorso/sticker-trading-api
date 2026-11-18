@@ -57,7 +57,7 @@ final readonly class DbOfferRepository implements OfferRepository
     {
         return $this->db->table(self::TABLE)
             ->where('status', OfferStatus::Accepted->value)
-            ->where('closed_at', '>=', $since->format(self::FORMAT))
+            ->where('closed_at', '>', $since->format(self::FORMAT))
             ->where(fn (Builder $q) => $q
                 ->where(fn (Builder $q) => $q->where('author_id', $userA)->where('accepted_by', $userB))
                 ->orWhere(fn (Builder $q) => $q->where('author_id', $userB)->where('accepted_by', $userA)))

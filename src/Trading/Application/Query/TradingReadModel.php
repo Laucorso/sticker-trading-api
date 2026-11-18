@@ -15,7 +15,7 @@ interface TradingReadModel
      *
      * @return array{data: list<array<string, mixed>>, next_cursor: ?string}
      */
-    public function openOffers(?int $stickerId, ?int $authorId, int $perPage, ?string $cursor): array;
+    public function openOffers(?int $offeredStickerId, ?int $requestedStickerId, ?int $authorId, int $perPage, ?string $cursor): array;
 
     /** @return list<array{sticker_id: int, name: string, quantity: int, reserved: int, tradeable: int}> */
     public function collectionOf(int $userId): array;

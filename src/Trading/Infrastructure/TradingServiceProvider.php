@@ -15,6 +15,7 @@ use Trading\Application\Query\TradingReadModel;
 use Trading\Domain\Collection\CollectionRepository;
 use Trading\Domain\Offer\OfferRepository;
 use Trading\Infrastructure\Broadcasting\LaravelEventPublisher;
+use Trading\Infrastructure\Console\ExpireOffersCommand;
 use Trading\Infrastructure\Persistence\DbCollectionRepository;
 use Trading\Infrastructure\Persistence\DbOfferRepository;
 use Trading\Infrastructure\Persistence\DbTradingReadModel;
@@ -32,4 +33,11 @@ final class TradingServiceProvider extends ServiceProvider
         CollectionRepository::class => DbCollectionRepository::class,
         TradingReadModel::class => DbTradingReadModel::class,
     ];
+
+    public function boot(): void
+    {
+        if ($this->app->runningInConsole()) {
+            $this->commands([ExpireOffersCommand::class]);
+        }
+    }
 }

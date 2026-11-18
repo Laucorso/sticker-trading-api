@@ -1,6 +1,6 @@
 {
     "$schema": "https://getcomposer.org/schema.json",
-    "name": "lauracormand/cromos-trading",
+    "name": "lauracormand/collectibol-trading",
     "type": "project",
     "description": "Backend de intercambio de cromos entre usuarios (prueba técnica).",
     "license": "MIT",

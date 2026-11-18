@@ -1,0 +1,68 @@
+x-app: &app
+  build: .
+  volumes:
+    - .:/app
+  environment:
+    DB_HOST: mysql
+    REVERB_HOST: reverb
+  depends_on:
+    mysql:
+      condition: service_healthy
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: trading
+      MYSQL_USER: trading
+      MYSQL_PASSWORD: secret
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 3s
+      retries: 30
+
+  # API + página de demo. Varios workers para atender peticiones en paralelo.
+  app:
+    <<: *app
+    environment:
+      DB_HOST: mysql
+      REVERB_HOST: reverb
+      PREPARE_APP: "1"
+      PHP_CLI_SERVER_WORKERS: "8"
+    command: php artisan serve --host=0.0.0.0 --port=8000
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8000/up"]
+      interval: 3s
+      retries: 60
+
+  # Envía las notificaciones a Reverb fuera de la petición.
+  queue:
+    <<: *app
+    command: php artisan queue:work --tries=5 --backoff=2
+    depends_on:
+      app:
+        condition: service_healthy
+
+  # Lanza offers:expire cada minuto.
+  scheduler:
+    <<: *app
+    command: php artisan schedule:work
+    depends_on:
+      app:
+        condition: service_healthy
+
+  reverb:
+    <<: *app
+    command: php artisan reverb:start --host=0.0.0.0 --port=8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      app:
+        condition: service_healthy

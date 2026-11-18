@@ -15,6 +15,11 @@ class DatabaseSeeder extends Seeder
 {
     public function run(): void
     {
+        // Idempotente: el contenedor lo ejecuta en cada arranque.
+        if (DB::table('users')->exists()) {
+            return;
+        }
+
         $now = now();
         $password = Hash::make('password');
 

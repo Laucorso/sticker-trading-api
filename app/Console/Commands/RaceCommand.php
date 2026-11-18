@@ -9,21 +9,23 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use Trading\Application\PublishOffer;
+use Trading\Application\WithdrawOffer;
 
 /**
  * Script de concurrencia contra la API real: lanza N peticiones HTTP simultáneas
- * (curl multi) y muestra cuántas salen adelante. Crea sus propios usuarios para
- * no interferir con los datos de la demo.
+ * (curl multi) y muestra cuántas salen adelante. Crea sus propios usuarios y, al
+ * terminar, retira las ofertas que hayan quedado abiertas para no ensuciar la demo.
  */
 class RaceCommand extends Command
 {
     protected $signature = 'trading:race
         {--requests=25 : Peticiones simultáneas por escenario}
-        {--url= : URL base de la API (por defecto APP_URL)}';
+        {--url= : URL base de la API (por defecto APP_URL)}
+        {--keep : No retirar al final las ofertas que queden abiertas}';
 
     protected $description = 'Lanza aceptaciones simultáneas sobre la misma oferta y verifica que solo una sale adelante';
 
-    public function handle(PublishOffer $publishOffer): int
+    public function handle(PublishOffer $publishOffer, WithdrawOffer $withdrawOffer): int
     {
         $n = (int) $this->option('requests');
         $url = rtrim($this->option('url') ?: config('app.url'), '/');
@@ -66,12 +68,33 @@ class RaceCommand extends Command
             && $left === 1;
         $this->line("   Copias que le quedan del cromo entregado: {$left} (nunca menos de 1)");
 
+        if (! $this->option('keep')) {
+            $this->withdrawLeftovers($offers, $withdrawOffer);
+        }
+
         $this->newLine();
         $ok1 && $ok2
             ? $this->info('✔ Las reglas se cumplen con peticiones simultáneas')
             : $this->error('✘ Se ha violado alguna regla');
 
         return $ok1 && $ok2 ? self::SUCCESS : self::FAILURE;
+    }
+
+    /**
+     * Retira con el caso de uso (no con un DELETE) las ofertas del escenario 2 que no
+     * se aceptaron, para que la reserva se libere igual que si lo hiciera su autor.
+     *
+     * @param  list<int>  $offerIds
+     */
+    private function withdrawLeftovers(array $offerIds, WithdrawOffer $withdrawOffer): void
+    {
+        $open = DB::table('offers')->whereIn('id', $offerIds)->where('status', 'open')->pluck('author_id', 'id');
+
+        foreach ($open as $offerId => $authorId) {
+            $withdrawOffer((int) $offerId, (int) $authorId);
+        }
+
+        $this->line("   Limpieza: {$open->count()} ofertas sin aceptar retiradas (usa --keep para conservarlas)");
     }
 
     /** @param array<int, Response|\Throwable> $responses */

@@ -19,6 +19,13 @@ interface OfferRepository
      */
     public function findForUpdate(int $id): ?Offer;
 
+    /**
+     * Ofertas abiertas del autor, bloqueadas por orden de id.
+     *
+     * @return list<Offer>
+     */
+    public function openByAuthorForUpdate(int $authorId): array;
+
     /** @return list<int> */
     public function idsDueForExpiration(DateTimeImmutable $now, int $limit): array;
 

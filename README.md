@@ -25,17 +25,18 @@ Autenticación simulada: cabecera `X-User-Id`.
 | POST | `/api/offers` `{offered_sticker_id, requested_sticker_id}` | Publicar |
 | POST | `/api/offers/{id}/accept` | Aceptar |
 | POST | `/api/offers/{id}/withdraw` | Retirar |
+| DELETE | `/api/me` | Borrar la cuenta (retira sus ofertas y la anonimiza) |
 | GET | `/api/users/{id}/collection` | Colección (`quantity`, `reserved`, `tradeable`) |
 | GET | `/api/stickers` | Catálogo |
 
-Los errores de negocio devuelven `{"error": "<code>", "message": "..."}` con un código estable: `no_spare_copy`, `offer_not_open`, `offer_expired`, `weekly_trade_limit_reached`, `cannot_accept_own_offer`, `not_offer_author`... (409 por defecto; 404, 403 o 422 donde corresponde).
+Los errores de negocio devuelven `{"error": "<code>", "message": "..."}` con un código estable: `no_spare_copy`, `offer_not_open`, `offer_expired`, `weekly_trade_limit_reached`, `cannot_accept_own_offer`, `not_offer_author`, `account_deleted`... (409 por defecto; 404, 403 o 422 donde corresponde).
 
 ## Arquitectura
 
 ```
 src/Trading/
-  Domain/          Offer, StickerHolding, WeeklyTradeLimit, excepciones. PHP puro, sin Laravel.
-  Application/     PublishOffer, AcceptOffer, WithdrawOffer, ExpireDueOffers + puertos (UserLock, read model)
+  Domain/          Offer, StickerHolding (+ VO Copies), WeeklyTradeLimit, excepciones. PHP puro, sin Laravel.
+  Application/     PublishOffer, AcceptOffer, WithdrawOffer, ExpireDueOffers, DeleteAccount + puertos (UserLock, Accounts, read model)
   Infrastructure/  Repositorios MySQL, HTTP, Broadcasting (Reverb), comando de caducidad, ServiceProvider
 src/Shared/        Clock, TransactionManager, EventPublisher
 ```
@@ -73,13 +74,13 @@ La fila de `users` hace de mutex por usuario porque siempre existe. Bloquear fil
 - Retirar una oferta vencida que el barrido aún no ha procesado devuelve `offer_expired`; el barrido libera el cromo en menos de un minuto.
 - Un intercambio aceptado es definitivo.
 - Cualquier usuario puede ver la colección de otro (lo necesita para decidir qué ofrecer).
-- **Borrado de cuenta** (no implementado): en una transacción con el lock del usuario se retirarían sus ofertas abiertas (liberando reservas) y se anonimizaría la cuenta en vez de borrarla, para no perder el historial de la otra parte. La FK `restrict` de `offers` impide hoy un borrado físico accidental.
+- **Borrado de cuenta** (`DELETE /api/me`): no se borra la fila, se anonimiza (nombre, email y contraseña) y se marca con `deleted_at`, para que la otra parte conserve su historial de intercambios; la FK `restrict` de `offers` impide además un borrado físico accidental. En la misma transacción se retiran sus ofertas abiertas liberando las reservas (las vencidas que el barrido aún no ha procesado se marcan como caducadas). Respeta el orden de bloqueo **ofertas → usuario**: si alguien acepta a la vez, gana quien coja antes el lock de la oferta. Con el lock del usuario se relee, para recoger ofertas publicadas mientras tanto. `PublishOffer` y `AcceptOffer` comprueban, ya con el lock del usuario, que ninguna cuenta implicada esté borrada (`account_deleted`); por HTTP una cuenta borrada ya ni se autentica. Su colección se conserva tal cual. No se envían avisos al autor borrado.
 
 ## Tests
 
-- **Unit** (dominio, sin BD): ciclo de vida de la oferta e invariantes de `StickerHolding`.
+- **Unit** (dominio, sin BD): ciclo de vida de la oferta e invariantes del VO inmutable `Copies` y de `StickerHolding`.
 - **Feature** (HTTP + MySQL): cada regla de negocio, caducidad con `travel()`, aviso en el canal correcto y que no se emite si la operación falla.
-- **Concurrencia** (`tests/Concurrency`): cada operación en un proceso hijo (`pcntl_fork`) con su propia conexión, todos arrancando tras una barrera de tiempo. Escenarios: 20 usuarios aceptando la misma oferta, un usuario con una repetida aceptando 10, 10 intercambios simultáneos de la misma pareja, 10 publicaciones con la misma repetida, y aceptar y retirar a la vez. Además de quién gana, se comprueba que no se crean ni se destruyen cromos.
+- **Concurrencia** (`tests/Concurrency`): cada operación en un proceso hijo (`pcntl_fork`) con su propia conexión, todos arrancando tras una barrera de tiempo. Escenarios: 20 usuarios aceptando la misma oferta, un usuario con una repetida aceptando 10, 10 intercambios simultáneos de la misma pareja, 10 publicaciones con la misma repetida, aceptar y retirar a la vez, aceptar una oferta mientras su autor borra la cuenta (o queda aceptada, o retirada con el cromo liberado) y publicar mientras se borra la cuenta (nunca queda una oferta abierta de una cuenta borrada). Además de quién gana, se comprueba que no se crean ni se destruyen cromos.
 
 Para saber que estos tests detectan algo, se quitaron los `FOR UPDATE` y se ejecutaron: **los 5 fallan** (8 usuarios «ganaban» la misma oferta, la pareja hacía 10 intercambios en una semana, la misma repetida respaldaba 3 ofertas…).
 
@@ -93,18 +94,19 @@ Para saber que estos tests detectan algo, se quitaron los `FOR UPDATE` y se ejec
 
 ## Fuera de alcance / con más tiempo
 
-- Idempotency keys en aceptar y publicar (un reintento del móvil no debería dar un 409 confuso).
-- Rate limiting por usuario, borrado de cuenta, OpenAPI, PHPStan y CI.
-- Patrón outbox (ver abajo).
+1. **Notificaciones persistentes.** El websocket solo llega si el autor está conectado; con la app cerrada, el aviso se pierde. Guardaría una tabla `notifications` (bandeja de entrada con leídas/no leídas) y enviaría push móvil (FCM/APNs) a quien no esté conectado. El websocket pasa a ser una vía de entrega, no la fuente de verdad.
+2. **Patrón outbox.** Si el proceso muere entre el commit y el encolado, el intercambio queda hecho pero el aviso se pierde. Escribiría el evento en una tabla `outbox` dentro de la misma transacción y un relay lo publicaría, con entrega at-least-once y consumidores idempotentes.
+3. **Idempotencia en aceptar y publicar.** Con una mala conexión un `publish` repetido crea dos ofertas y un `accept` repetido devuelve un 409 confuso aunque el primero saliera bien. Con una cabecera `Idempotency-Key` guardada junto a su respuesta, un reintento devuelve el resultado original.
+4. **Arquitectura protegida por herramientas.** PHPStan a nivel máximo y una regla de arquitectura (Deptrac o tests de arquitectura) que falle si `Domain` importa `Illuminate`, todo en CI con MySQL. Hoy la separación de capas depende de la disciplina.
+5. **Contrato de API y de eventos.** OpenAPI de la API y payloads de websocket versionados (`offer.accepted` v1), para que el backend evolucione sin romperse.
+6. **Seguridad: autenticación real y rate limiting.** Sustituir la cabecera `X-User-Id` por tokens (Sanctum, o el proveedor de identidad de la app móvil). Es un cambio localizado: el resto del código solo usa `$request->user()`, y la autorización de los canales privados de Reverb reutiliza el mismo guard. Límite de peticiones por usuario en publicar y aceptar para frenar bots.
 
 ## Para producción con mucho tráfico
 
-- **Avisos fiables:** hoy, si el proceso muere entre el commit y el encolado, el aviso se pierde (el intercambio no). Una tabla *outbox* escrita en la misma transacción y un relay lo garantizan.
-- **Runtime:** nginx + PHP-FPM u Octane en lugar de `artisan serve`; colas en Redis/SQS con Horizon; Reverb escalado horizontalmente con Redis pub/sub (o el gateway de NestJS).
-- **Contención:** el lock por usuario serializa solo las operaciones de ese usuario, suficiente aquí. Si un usuario muy activo se convirtiera en un punto caliente, pasaría a UPDATE condicionales atómicos para las reservas.
-- **Lecturas:** listado y colección desde réplicas, con caché corta para el listado.
-- **Barrido:** varios workers con `FOR UPDATE SKIP LOCKED` si el volumen de caducadas lo pide.
-- **Observabilidad:** métricas de esperas de lock, deadlocks y reintentos, latencia del aviso (aceptación → entrega) y tamaño de la cola.
+- **Runtime en AWS:** nginx + PHP-FPM u Octane detrás de un balanceador, con web, workers y scheduler como servicios separados que escalan por separado (ECS). Colas en SQS (o Redis con Horizon) y Reverb en varias réplicas con Redis pub/sub (ElastiCache).
+- **Base de datos:** Aurora MySQL con **RDS Proxy**: cientos de workers PHP con conexiones propias agotan las de MySQL en un pico. Listado y colección desde réplicas con caché corta; tras escribir se lee de la primaria (`'sticky' => true`) para que el usuario vea su propio cambio.
+- **Crecimiento de datos:** `offers` acumula ofertas cerradas y el camino crítico solo necesita las abiertas. Archivaría o particionaría las cerradas, sacaría el historial a una tabla `trades` con un contador por pareja y ventana para el límite semanal en vez de un `COUNT`, y haría el barrido de caducadas en lotes con `FOR UPDATE SKIP LOCKED` y varios workers.
+- **Observabilidad y validación:** Sentry para errores; métricas de esperas de lock, deadlocks, reintentos, tamaño de cola y latencia del aviso (aceptación → entrega), con alertas; logs correlados por `offer_id`. Antes de un lanzamiento, pruebas de carga con escenarios con como miles de usuarios sobre las mismas ofertas, y no solo de volumen. Laravel Pulse (monitorización Websockets).
 
 ## Uso de la IA
 

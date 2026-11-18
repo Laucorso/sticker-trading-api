@@ -7,6 +7,7 @@ namespace Tests\Concurrency;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\Test;
 use Trading\Application\AcceptOffer;
+use Trading\Application\DeleteAccount;
 use Trading\Application\PublishOffer;
 use Trading\Application\WithdrawOffer;
 
@@ -147,5 +148,66 @@ final class ConcurrentTradingTest extends ConcurrencyTestCase
         $this->assertSame(['quantity' => 11 - $accepted, 'reserved' => 0], $this->holding($ana, $this->messi));
         $this->assertSame(11, $this->totalCopies($this->messi));
         $this->assertSame(11, $this->totalCopies($this->pedri));
+    }
+
+    #[Test]
+    public function accepting_an_offer_while_its_author_deletes_the_account_leaves_a_consistent_state(): void
+    {
+        $bruno = $this->createUser('bruno');
+        $this->giveStickers($bruno, $this->pedri, 11);
+
+        $authors = $offers = $operations = [];
+        for ($i = 0; $i < 5; $i++) {
+            $authors[$i] = $author = $this->createUser("author{$i}");
+            $this->giveStickers($author, $this->messi, 2);
+            $offers[$i] = $offerId = app(PublishOffer::class)($author, $this->messi, $this->pedri)->id();
+            $operations[] = fn () => app(AcceptOffer::class)($offerId, $bruno);
+            $operations[] = fn () => app(DeleteAccount::class)($author);
+        }
+
+        $results = $this->runConcurrently($operations);
+
+        foreach (array_chunk($results, 2) as $i => [$accept, $delete]) {
+            // El borrado siempre se completa; la aceptación gana o encuentra la oferta retirada.
+            $this->assertSame('ok', $delete, "Borrado {$i}");
+            $this->assertContains($accept, ['ok', 'offer_not_open'], "Aceptación {$i}");
+
+            $status = DB::table('offers')->where('id', $offers[$i])->value('status');
+            $this->assertSame($accept === 'ok' ? 'accepted' : 'withdrawn', $status);
+            // O se entregó la copia reservada, o se liberó: nunca queda reservada.
+            $this->assertSame(
+                ['quantity' => $accept === 'ok' ? 1 : 2, 'reserved' => 0],
+                $this->holding($authors[$i], $this->messi),
+            );
+            $this->assertNotNull(DB::table('users')->where('id', $authors[$i])->value('deleted_at'));
+        }
+
+        $this->assertSame(10, $this->totalCopies($this->messi));
+        $this->assertSame(11, $this->totalCopies($this->pedri));
+    }
+
+    #[Test]
+    public function a_deleted_account_never_keeps_open_offers_even_if_it_was_publishing_at_the_same_time(): void
+    {
+        $ana = $this->createUser('ana');
+        $this->giveStickers($ana, $this->messi, 11);
+
+        $operations = array_fill(0, 10, fn () => app(PublishOffer::class)($ana, $this->messi, $this->pedri));
+        $operations[] = fn () => app(DeleteAccount::class)($ana);
+
+        $results = $this->runConcurrently($operations);
+
+        $this->assertSame('ok', array_pop($results));
+        foreach ($results as $publish) {
+            // Publicó antes del borrado (y el borrado la retiró) o llegó tarde.
+            $this->assertContains($publish, ['ok', 'account_deleted']);
+        }
+
+        $this->assertSame(0, DB::table('offers')->where('author_id', $ana)->where('status', 'open')->count());
+        $this->assertSame(
+            count(array_keys($results, 'ok', true)),
+            DB::table('offers')->where('author_id', $ana)->where('status', 'withdrawn')->count(),
+        );
+        $this->assertSame(['quantity' => 11, 'reserved' => 0], $this->holding($ana, $this->messi));
     }
 }

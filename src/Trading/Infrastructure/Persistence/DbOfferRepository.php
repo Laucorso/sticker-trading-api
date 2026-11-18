@@ -41,6 +41,18 @@ final readonly class DbOfferRepository implements OfferRepository
         return $row === null ? null : $this->hydrate($row);
     }
 
+    public function openByAuthorForUpdate(int $authorId): array
+    {
+        return $this->db->table(self::TABLE)
+            ->where('author_id', $authorId)
+            ->where('status', OfferStatus::Open->value)
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->get()
+            ->map(fn (object $row) => $this->hydrate($row))
+            ->all();
+    }
+
     public function idsDueForExpiration(DateTimeImmutable $now, int $limit): array
     {
         return $this->db->table(self::TABLE)

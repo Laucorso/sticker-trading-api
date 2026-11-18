@@ -7,6 +7,7 @@ namespace Trading\Application;
 use Shared\Application\EventPublisher;
 use Shared\Application\TransactionManager;
 use Shared\Domain\Clock;
+use Trading\Application\Port\Accounts;
 use Trading\Application\Port\UserLock;
 use Trading\Domain\Collection\CollectionRepository;
 use Trading\Domain\Exception\OfferNotFound;
@@ -23,6 +24,8 @@ use Trading\Domain\Trade\WeeklyTradeLimit;
  * - El mismo usuario aceptando varias ofertas: espera a su propio lock de usuario
  *   y, cuando entra, ve sus copias ya descontadas (NoSpareCopy).
  * - La misma pareja a la vez: el lock de los dos usuarios serializa el conteo semanal.
+ * - Si una de las dos cuentas se borra a la vez: con el lock de los usuarios se
+ *   comprueba que ambas siguen activas (AccountDeleted).
  */
 final readonly class AcceptOffer
 {
@@ -32,6 +35,7 @@ final readonly class AcceptOffer
         private OfferRepository $offers,
         private CollectionRepository $collections,
         private WeeklyTradeLimit $tradeLimit,
+        private Accounts $accounts,
         private EventPublisher $events,
         private Clock $clock,
     ) {}
@@ -45,6 +49,7 @@ final readonly class AcceptOffer
             $accepted = $offer->accept($acceptorId, $now);
 
             $this->userLock->lock($offer->authorId(), $acceptorId);
+            $this->accounts->ensureActive($offer->authorId(), $acceptorId);
             $this->tradeLimit->ensureCanTrade($offer->authorId(), $acceptorId, $now);
             $this->swapStickers($accepted);
 

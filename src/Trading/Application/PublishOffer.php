@@ -6,6 +6,7 @@ namespace Trading\Application;
 
 use Shared\Application\TransactionManager;
 use Shared\Domain\Clock;
+use Trading\Application\Port\Accounts;
 use Trading\Application\Port\UserLock;
 use Trading\Domain\Collection\CollectionRepository;
 use Trading\Domain\Offer\Offer;
@@ -18,6 +19,7 @@ final readonly class PublishOffer
         private UserLock $userLock,
         private OfferRepository $offers,
         private CollectionRepository $collections,
+        private Accounts $accounts,
         private Clock $clock,
     ) {}
 
@@ -27,6 +29,7 @@ final readonly class PublishOffer
             $offer = Offer::publish($authorId, $offeredStickerId, $requestedStickerId, $this->clock->now());
 
             $this->userLock->lock($authorId);
+            $this->accounts->ensureActive($authorId);
 
             $holding = $this->collections->holdingOf($authorId, $offeredStickerId);
             $holding->reserveSpare();

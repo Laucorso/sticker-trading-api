@@ -79,6 +79,32 @@ final class StickerHoldingTest extends TestCase
     }
 
     #[Test]
+    public function the_domain_error_says_whose_copies_are_missing(): void
+    {
+        try {
+            (new StickerHolding(7, 42, 1, 0))->handOverSpare();
+            $this->fail('Debería haber lanzado NoSpareCopy');
+        } catch (NoSpareCopy $e) {
+            $this->assertSame(7, $e->userId);
+            $this->assertSame(42, $e->stickerId);
+        }
+    }
+
+    #[Test]
+    public function a_failed_transition_leaves_the_copies_unchanged(): void
+    {
+        $holding = new StickerHolding(1, 1, 2, 1);
+
+        try {
+            $holding->reserveSpare();
+        } catch (NoSpareCopy) {
+        }
+
+        $this->assertSame(2, $holding->quantity());
+        $this->assertSame(1, $holding->reserved());
+    }
+
+    #[Test]
     public function it_rejects_states_that_break_the_invariant(): void
     {
         $this->expectException(\InvalidArgumentException::class);

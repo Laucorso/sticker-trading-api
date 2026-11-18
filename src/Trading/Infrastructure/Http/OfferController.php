@@ -10,40 +10,23 @@ use Trading\Application\AcceptOffer;
 use Trading\Application\PublishOffer;
 use Trading\Application\Query\TradingReadModel;
 use Trading\Application\WithdrawOffer;
+use Trading\Infrastructure\Http\Requests\ListOffersRequest;
+use Trading\Infrastructure\Http\Requests\PublishOfferRequest;
 
-/** Adaptador HTTP: valida forma, extrae el usuario y delega en el caso de uso. */
+/** Adaptador HTTP: la forma la validan las FormRequest; aquí solo se delega en el caso de uso. */
 final class OfferController
 {
-    public function index(Request $request, TradingReadModel $readModel): JsonResponse
+    public function index(ListOffersRequest $request, TradingReadModel $readModel): JsonResponse
     {
-        $filters = $request->validate([
-            'offered_sticker_id' => ['nullable', 'integer'],
-            'requested_sticker_id' => ['nullable', 'integer'],
-            'author_id' => ['nullable', 'integer'],
-            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
-            'cursor' => ['nullable', 'string'],
-        ]);
-
-        return response()->json($readModel->openOffers(
-            offeredStickerId: isset($filters['offered_sticker_id']) ? (int) $filters['offered_sticker_id'] : null,
-            requestedStickerId: isset($filters['requested_sticker_id']) ? (int) $filters['requested_sticker_id'] : null,
-            authorId: isset($filters['author_id']) ? (int) $filters['author_id'] : null,
-            perPage: (int) ($filters['per_page'] ?? 20),
-            cursor: $filters['cursor'] ?? null,
-        ));
+        return response()->json($readModel->openOffers($request->toQuery()));
     }
 
-    public function store(Request $request, PublishOffer $publishOffer): JsonResponse
+    public function store(PublishOfferRequest $request, PublishOffer $publishOffer): JsonResponse
     {
-        $data = $request->validate([
-            'offered_sticker_id' => ['required', 'integer', 'exists:stickers,id'],
-            'requested_sticker_id' => ['required', 'integer', 'exists:stickers,id'],
-        ]);
-
         $offer = $publishOffer(
-            authorId: (int) $request->user()->id,
-            offeredStickerId: (int) $data['offered_sticker_id'],
-            requestedStickerId: (int) $data['requested_sticker_id'],
+            authorId: $request->authorId(),
+            offeredStickerId: $request->offeredStickerId(),
+            requestedStickerId: $request->requestedStickerId(),
         );
 
         return response()->json(['data' => OfferPresenter::toArray($offer)], 201);

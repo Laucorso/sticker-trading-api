@@ -6,6 +6,7 @@ namespace Trading\Infrastructure\Persistence;
 
 use Carbon\CarbonImmutable;
 use Illuminate\Database\ConnectionInterface;
+use Trading\Application\Query\OpenOffersQuery;
 use Trading\Application\Query\TradingReadModel;
 use Trading\Domain\Collection\StickerHolding;
 use Trading\Domain\Offer\OfferStatus;
@@ -14,7 +15,7 @@ final readonly class DbTradingReadModel implements TradingReadModel
 {
     public function __construct(private ConnectionInterface $db) {}
 
-    public function openOffers(?int $offeredStickerId, ?int $requestedStickerId, ?int $authorId, int $perPage, ?string $cursor): array
+    public function openOffers(OpenOffersQuery $query): array
     {
         $page = $this->db->table('offers as o')
             ->join('users as u', 'u.id', '=', 'o.author_id')
@@ -23,9 +24,9 @@ final readonly class DbTradingReadModel implements TradingReadModel
             ->where('o.status', OfferStatus::Open->value)
             // Una oferta vencida que el job aún no ha barrido ya no se muestra.
             ->where('o.expires_at', '>', CarbonImmutable::now('UTC')->format('Y-m-d H:i:s'))
-            ->when($offeredStickerId, fn ($q) => $q->where('o.offered_sticker_id', $offeredStickerId))
-            ->when($requestedStickerId, fn ($q) => $q->where('o.requested_sticker_id', $requestedStickerId))
-            ->when($authorId, fn ($q) => $q->where('o.author_id', $authorId))
+            ->when($query->offeredStickerId, fn ($q, int $id) => $q->where('o.offered_sticker_id', $id))
+            ->when($query->requestedStickerId, fn ($q, int $id) => $q->where('o.requested_sticker_id', $id))
+            ->when($query->authorId, fn ($q, int $id) => $q->where('o.author_id', $id))
             ->orderByDesc('o.id')
             ->select([
                 'o.id', 'o.author_id', 'u.name as author_name',
@@ -33,7 +34,7 @@ final readonly class DbTradingReadModel implements TradingReadModel
                 'o.requested_sticker_id', 'sr.name as requested_sticker_name',
                 'o.status', 'o.created_at', 'o.expires_at',
             ])
-            ->cursorPaginate($perPage, ['*'], 'cursor', $cursor);
+            ->cursorPaginate($query->perPage, ['*'], 'cursor', $query->cursor);
 
         return [
             'data' => collect($page->items())->map(fn (object $row) => [

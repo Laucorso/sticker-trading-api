@@ -100,6 +100,7 @@ Para saber que estos tests detectan algo, se quitaron los `FOR UPDATE` y se ejec
 4. **Arquitectura protegida por herramientas.** PHPStan a nivel máximo y una regla de arquitectura (Deptrac o tests de arquitectura) que falle si `Domain` importa `Illuminate`, todo en CI con MySQL. Hoy la separación de capas depende de la disciplina.
 5. **Contrato de API y de eventos.** OpenAPI de la API y payloads de websocket versionados (`offer.accepted` v1), para que el backend evolucione sin romperse.
 6. **Seguridad: autenticación real y rate limiting.** Sustituir la cabecera `X-User-Id` por tokens (Sanctum, o el proveedor de identidad de la app móvil). Es un cambio localizado: el resto del código solo usa `$request->user()`, y la autorización de los canales privados de Reverb reutiliza el mismo guard. Límite de peticiones por usuario en publicar y aceptar para frenar bots.
+7. **Documentación extra** Añadir README.md para cada bounded context y para IA.
 
 ## Para producción con mucho tráfico
 

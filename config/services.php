@@ -35,4 +35,12 @@ return [
         ],
     ],
 
+
+    // Dónde se conecta el navegador de la demo (puede diferir del host interno de Reverb).
+    'reverb_client' => [
+        'key' => env('REVERB_APP_KEY'),
+        'host' => env('REVERB_PUBLIC_HOST', 'localhost'),
+        'port' => (int) env('REVERB_PUBLIC_PORT', 8080),
+    ],
+
 ];

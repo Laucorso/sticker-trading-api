@@ -19,4 +19,7 @@ interface TradingReadModel
 
     /** @return list<array{sticker_id: int, name: string, quantity: int, reserved: int, tradeable: int}> */
     public function collectionOf(int $userId): array;
+
+    /** @return list<array{id: int, name: string}> */
+    public function stickers(): array;
 }

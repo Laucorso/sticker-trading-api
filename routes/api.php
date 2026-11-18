@@ -1,6 +1,7 @@
 <?php
 
 use Illuminate\Support\Facades\Route;
+use Trading\Application\Query\TradingReadModel;
 use Trading\Infrastructure\Http\CollectionController;
 use Trading\Infrastructure\Http\OfferController;
 
@@ -11,4 +12,5 @@ Route::middleware('auth:api')->group(function (): void {
     Route::post('/offers/{offer}/withdraw', [OfferController::class, 'withdraw'])->whereNumber('offer');
 
     Route::get('/users/{user}/collection', CollectionController::class)->whereNumber('user');
+    Route::get('/stickers', fn (TradingReadModel $readModel) => ['data' => $readModel->stickers()]);
 });

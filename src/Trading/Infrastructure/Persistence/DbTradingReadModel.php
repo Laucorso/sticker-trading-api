@@ -67,6 +67,13 @@ final readonly class DbTradingReadModel implements TradingReadModel
             ->all();
     }
 
+    public function stickers(): array
+    {
+        return $this->db->table('stickers')->orderBy('id')->get(['id', 'name'])
+            ->map(fn (object $row) => ['id' => (int) $row->id, 'name' => $row->name])
+            ->all();
+    }
+
     private function iso(string $value): string
     {
         return CarbonImmutable::parse($value, 'UTC')->toIso8601ZuluString();

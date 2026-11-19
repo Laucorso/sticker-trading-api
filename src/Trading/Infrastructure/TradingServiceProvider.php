@@ -22,6 +22,9 @@ use Trading\Infrastructure\Persistence\DbCollectionRepository;
 use Trading\Infrastructure\Persistence\DbOfferRepository;
 use Trading\Infrastructure\Persistence\DbTradingReadModel;
 use Trading\Infrastructure\Persistence\DbUserLock;
+use Illuminate\Cache\RateLimiting\Limit;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\RateLimiter;
 
 /** Único punto donde se decide qué adaptador implementa cada puerto. */
 final class TradingServiceProvider extends ServiceProvider
@@ -39,6 +42,11 @@ final class TradingServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
+        // Protege los locks: un cliente que dispara accepts en bucle convierte su fila de users en punto caliente.
+        RateLimiter::for('trading-writes', fn (Request $request) =>
+            Limit::perMinute(60)->by($request->user()?->id ?: $request->ip())
+        );
+
         if ($this->app->runningInConsole()) {
             $this->commands([ExpireOffersCommand::class]);
         }

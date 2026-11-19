@@ -36,7 +36,7 @@ HTTP: las FormRequest (`Infrastructure/Http/Requests`) validan solo la forma y e
 
 ### Concurrencia: lo que hay que respetar al tocar un caso de uso
 
-- Cada caso de uso de escritura corre dentro de `TransactionManager::run()`, que reintenta la closure entera ante deadlock (3 intentos). Todo lo que se lee y se escribe debe ir dentro de la closure.
+- Cada caso de uso de escritura corre dentro de `TransactionManager::run()`, que reintenta la closure entera ante deadlock o `Lock wait timeout` (3 intentos). Todo lo que se lee y se escribe debe ir dentro de la closure. MySQL corre con `--innodb-lock-wait-timeout=3` (`docker-compose.yml`): una transacción que retenga locks más de 3 s hace fallar a quien espera, y tras 3 intentos sale un 500.
 - **Orden de bloqueo fijo: oferta(s) por id → usuarios por id** (`UserLock`, `SELECT … FOR UPDATE` sobre `users`). Romper el orden provoca deadlocks.
 - Cualquier operación que modifique la colección de un usuario o cuente sus intercambios bloquea antes a ese usuario y, con el lock tomado, comprueba `Accounts::ensureActive()`.
 - Aislamiento `READ COMMITTED` (`config/database.php`): tras bloquear se lee con SELECT normales y se ve lo último confirmado. Un `FOR UPDATE` por rango no bloquea huecos, así que lo insertado por otra transacción solo se ve al volver a leer (por eso `DeleteAccount` relee las ofertas con el lock del usuario).
@@ -47,6 +47,8 @@ HTTP: las FormRequest (`Infrastructure/Http/Requests`) validan solo la forma y e
 ### Errores
 
 Las violaciones de reglas extienden `TradingException` con un `errorCode()` estable. `TradingExceptionRenderer` decide el status (409 por defecto; el mapa `STATUS` fija 404, 403 y 422). Una excepción nueva que no deba ser 409 se añade a ese mapa.
+
+Las rutas de escritura (`routes/api.php`) van bajo `throttle:trading-writes`, 60 por minuto por usuario, definido en `TradingServiceProvider::boot()`. Una ruta de escritura nueva va dentro de ese grupo. El 429 lo genera Laravel y no lleva el campo `error`. En tests la caché es `array` y cada test parte de cero; `trading:race --requests` > 60 choca con el límite.
 
 ## Tests
 

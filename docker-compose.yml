@@ -12,6 +12,8 @@ x-app: &app
 services:
   mysql:
     image: mysql:8.4
+    # Falla rápido bajo contención en vez de dejar workers esperando 50 s (valor por defecto).
+    command: --innodb-lock-wait-timeout=3
     environment:
       MYSQL_DATABASE: trading
       MYSQL_USER: trading

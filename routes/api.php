@@ -8,12 +8,13 @@ use Trading\Infrastructure\Http\OfferController;
 
 Route::middleware('auth:api')->group(function (): void {
     Route::get('/offers', [OfferController::class, 'index']);
-    Route::post('/offers', [OfferController::class, 'store']);
-    Route::post('/offers/{offer}/accept', [OfferController::class, 'accept'])->whereNumber('offer');
-    Route::post('/offers/{offer}/withdraw', [OfferController::class, 'withdraw'])->whereNumber('offer');
-
-    Route::delete('/me', AccountController::class);
-
     Route::get('/users/{user}/collection', CollectionController::class)->whereNumber('user');
     Route::get('/stickers', fn (TradingReadModel $readModel) => ['data' => $readModel->stickers()]);
+
+    Route::middleware('throttle:trading-writes')->group(function (): void {
+        Route::post('/offers', [OfferController::class, 'store']);
+        Route::post('/offers/{offer}/accept', [OfferController::class, 'accept'])->whereNumber('offer');
+        Route::post('/offers/{offer}/withdraw', [OfferController::class, 'withdraw'])->whereNumber('offer');
+        Route::delete('/me', AccountController::class);
+    });
 });

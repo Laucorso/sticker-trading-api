@@ -36,7 +36,9 @@ services:
       REVERB_HOST: reverb
       PREPARE_APP: "1"
       PHP_CLI_SERVER_WORKERS: "8"
-    command: php artisan serve --host=0.0.0.0 --port=8000
+    # --no-reload: sin él, artisan serve ignora PHP_CLI_SERVER_WORKERS y usa un solo
+    # worker. A cambio, tras editar .env o config hay que reiniciar el servicio.
+    command: php artisan serve --host=0.0.0.0 --port=8000 --no-reload
     ports:
       - "8000:8000"
     healthcheck:

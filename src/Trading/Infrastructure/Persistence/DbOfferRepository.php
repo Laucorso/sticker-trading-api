@@ -8,6 +8,8 @@ use DateTimeImmutable;
 use DateTimeZone;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Query\Builder;
+use Illuminate\Database\QueryException;
+use Trading\Domain\Exception\OfferBusy;
 use Trading\Domain\Offer\Offer;
 use Trading\Domain\Offer\OfferRepository;
 use Trading\Domain\Offer\OfferStatus;
@@ -17,6 +19,9 @@ final readonly class DbOfferRepository implements OfferRepository
     private const TABLE = 'offers';
 
     private const FORMAT = 'Y-m-d H:i:s';
+
+    /** ER_LOCK_NOWAIT: la fila está bloqueada y la consulta pidió NOWAIT. */
+    private const LOCK_NOT_AVAILABLE = 3572;
 
     public function __construct(private ConnectionInterface $db) {}
 
@@ -37,6 +42,18 @@ final readonly class DbOfferRepository implements OfferRepository
     public function findForUpdate(int $id): ?Offer
     {
         $row = $this->db->table(self::TABLE)->where('id', $id)->lockForUpdate()->first();
+
+        return $row === null ? null : $this->hydrate($row);
+    }
+
+    public function findForUpdateNoWait(int $id): ?Offer
+    {
+        try {
+            $row = $this->db->table(self::TABLE)->where('id', $id)->lock('for update nowait')->first();
+        } catch (QueryException $e) {
+            // Laravel no reintenta este error (no es un deadlock), así que no hay reintentos en cadena.
+            throw ($e->errorInfo[1] ?? null) === self::LOCK_NOT_AVAILABLE ? new OfferBusy($id) : $e;
+        }
 
         return $row === null ? null : $this->hydrate($row);
     }

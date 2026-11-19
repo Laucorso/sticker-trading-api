@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Trading\Domain\Offer;
 
 use DateTimeImmutable;
+use Trading\Domain\Exception\OfferBusy;
 
 interface OfferRepository
 {
@@ -18,6 +19,14 @@ interface OfferRepository
      * Es lo que serializa varias aceptaciones/retiradas sobre la misma oferta.
      */
     public function findForUpdate(int $id): ?Offer;
+
+    /**
+     * Como findForUpdate(), pero sin hacer cola: si otra transacción ya tiene la
+     * oferta bloqueada, falla al momento.
+     *
+     * @throws OfferBusy
+     */
+    public function findForUpdateNoWait(int $id): ?Offer;
 
     /**
      * Ofertas abiertas del autor, bloqueadas por orden de id.

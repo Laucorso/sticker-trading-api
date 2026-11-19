@@ -44,7 +44,11 @@ final class ConcurrentTradingTest extends ConcurrencyTestCase
             $acceptors,
         ));
 
-        $this->assertOutcomes(['ok' => 1, 'offer_not_open' => 19], $results);
+        // Gana uno. El resto no hace cola: quien llega mientras el ganador la procesa
+        // recibe offer_busy al momento, y quien llega después del commit, offer_not_open.
+        $this->assertCount(1, array_keys($results, 'ok', true), 'Resultados: '.json_encode($results));
+        $losers = array_values(array_diff($results, ['ok']));
+        $this->assertSame([], array_values(array_diff($losers, ['offer_busy', 'offer_not_open'])), 'Resultados: '.json_encode($results));
 
         $winner = $acceptors[array_search('ok', $results, true)];
         $this->assertDatabaseHas('offers', ['id' => $offer->id(), 'status' => 'accepted', 'accepted_by' => $winner]);
@@ -54,6 +58,40 @@ final class ConcurrentTradingTest extends ConcurrencyTestCase
         // Ningún cromo se crea ni se destruye.
         $this->assertSame(2, $this->totalCopies($this->messi));
         $this->assertSame(40, $this->totalCopies($this->pedri));
+    }
+
+    #[Test]
+    public function accepting_an_offer_that_is_being_processed_fails_at_once_instead_of_queueing(): void
+    {
+        $ana = $this->createUser('ana');
+        $bruno = $this->createUser('bruno');
+        $this->giveStickers($ana, $this->messi, 2);
+        $this->giveStickers($bruno, $this->pedri, 2);
+        $offerId = app(PublishOffer::class)($ana, $this->messi, $this->pedri)->id();
+
+        $results = $this->runConcurrently([
+            // Otra transacción retiene la oferta 1,5 s.
+            fn () => DB::transaction(function () use ($offerId): void {
+                DB::table('offers')->where('id', $offerId)->lockForUpdate()->first();
+                usleep(1_500_000);
+            }),
+            function () use ($offerId, $bruno): void {
+                usleep(300_000);
+                $start = microtime(true);
+                try {
+                    app(AcceptOffer::class)($offerId, $bruno);
+                } finally {
+                    // Si hubiera esperado al lock (o reintentado), tardaría más de un segundo.
+                    if (microtime(true) - $start > 0.5) {
+                        throw new \RuntimeException('Ha hecho cola');
+                    }
+                }
+            },
+        ]);
+
+        $this->assertSame(['ok', 'offer_busy'], $results);
+        $this->assertDatabaseHas('offers', ['id' => $offerId, 'status' => 'open']);
+        $this->assertSame(['quantity' => 2, 'reserved' => 1], $this->holding($ana, $this->messi));
     }
 
     #[Test]
@@ -136,10 +174,13 @@ final class ConcurrentTradingTest extends ConcurrencyTestCase
 
         $results = $this->runConcurrently($operations);
 
-        // En cada pareja (aceptar, retirar) gana exactamente una de las dos.
-        foreach (array_chunk($results, 2) as $pair) {
-            $this->assertCount(1, array_keys($pair, 'ok', true), 'Pareja: '.json_encode($pair));
-            $this->assertContains('offer_not_open', $pair);
+        // En cada pareja (aceptar, retirar) gana exactamente una de las dos. Retirar espera
+        // al lock; aceptar no (offer_busy si la retirada ya tenía la oferta bloqueada).
+        foreach (array_chunk($results, 2) as [$accept, $withdraw]) {
+            $pair = json_encode([$accept, $withdraw]);
+            $this->assertCount(1, array_keys([$accept, $withdraw], 'ok', true), "Pareja: {$pair}");
+            $this->assertContains($accept, ['ok', 'offer_not_open', 'offer_busy'], "Pareja: {$pair}");
+            $this->assertContains($withdraw, ['ok', 'offer_not_open'], "Pareja: {$pair}");
         }
 
         $accepted = DB::table('offers')->where('status', 'accepted')->count();
@@ -148,6 +189,52 @@ final class ConcurrentTradingTest extends ConcurrencyTestCase
         $this->assertSame(['quantity' => 11 - $accepted, 'reserved' => 0], $this->holding($ana, $this->messi));
         $this->assertSame(11, $this->totalCopies($this->messi));
         $this->assertSame(11, $this->totalCopies($this->pedri));
+    }
+
+    #[Test]
+    public function many_users_accepting_different_offers_of_the_same_author_at_once_all_succeed_without_losing_copies(): void
+    {
+        // Ana no tiene ningún Pedri: las 30 aceptaciones crean y suman la misma fila a la vez.
+        $ana = $this->createUser('ana');
+        $this->giveStickers($ana, $this->messi, 31);
+
+        $operations = [];
+        for ($i = 0; $i < 30; $i++) {
+            $offerId = app(PublishOffer::class)($ana, $this->messi, $this->pedri)->id();
+            $acceptor = $this->createUser("acceptor{$i}");
+            $this->giveStickers($acceptor, $this->pedri, 2);
+            $operations[] = fn () => app(AcceptOffer::class)($offerId, $acceptor);
+        }
+
+        $results = $this->runConcurrently($operations);
+
+        $this->assertOutcomes(['ok' => 30], $results);
+        $this->assertSame(['quantity' => 1, 'reserved' => 0], $this->holding($ana, $this->messi));
+        $this->assertSame(['quantity' => 30, 'reserved' => 0], $this->holding($ana, $this->pedri));
+        $this->assertSame(31, $this->totalCopies($this->messi));
+        $this->assertSame(60, $this->totalCopies($this->pedri));
+    }
+
+    #[Test]
+    public function the_weekly_limit_holds_when_the_pair_trades_in_both_directions_at_once(): void
+    {
+        $ana = $this->createUser('ana');
+        $bruno = $this->createUser('bruno');
+        $this->giveStickers($ana, $this->messi, 20);
+        $this->giveStickers($bruno, $this->pedri, 20);
+
+        $operations = [];
+        for ($i = 0; $i < 5; $i++) {
+            $anaOffer = app(PublishOffer::class)($ana, $this->messi, $this->pedri)->id();
+            $brunoOffer = app(PublishOffer::class)($bruno, $this->pedri, $this->messi)->id();
+            $operations[] = fn () => app(AcceptOffer::class)($anaOffer, $bruno);
+            $operations[] = fn () => app(AcceptOffer::class)($brunoOffer, $ana);
+        }
+
+        $results = $this->runConcurrently($operations);
+
+        $this->assertOutcomes(['ok' => 5, 'weekly_trade_limit_reached' => 5], $results);
+        $this->assertSame(5, DB::table('offers')->where('status', 'accepted')->count());
     }
 
     #[Test]
@@ -170,7 +257,7 @@ final class ConcurrentTradingTest extends ConcurrencyTestCase
         foreach (array_chunk($results, 2) as $i => [$accept, $delete]) {
             // El borrado siempre se completa; la aceptación gana o encuentra la oferta retirada.
             $this->assertSame('ok', $delete, "Borrado {$i}");
-            $this->assertContains($accept, ['ok', 'offer_not_open'], "Aceptación {$i}");
+            $this->assertContains($accept, ['ok', 'offer_not_open', 'offer_busy'], "Aceptación {$i}");
 
             $status = DB::table('offers')->where('id', $offers[$i])->value('status');
             $this->assertSame($accept === 'ok' ? 'accepted' : 'withdrawn', $status);

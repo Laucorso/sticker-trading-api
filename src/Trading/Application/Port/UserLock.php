@@ -16,4 +16,13 @@ namespace Trading\Application\Port;
 interface UserLock
 {
     public function lock(int ...$userIds): void;
+
+    /**
+     * Para aceptar: quien acepta en exclusiva y el autor en compartido, en orden de id.
+     *
+     * Varias aceptaciones de ofertas distintas del mismo autor no se esperan entre sí;
+     * cualquier operación que bloquee al autor en exclusiva (publicar, retirar,
+     * caducar, borrar la cuenta o aceptar él una oferta) sí espera, y viceversa.
+     */
+    public function lockForTrade(int $authorId, int $acceptorId): void;
 }

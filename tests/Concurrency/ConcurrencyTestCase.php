@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Concurrency;
 
-use Illuminate\Foundation\Testing\DatabaseMigrations;
+use Illuminate\Foundation\Testing\DatabaseTruncation;
 use Illuminate\Support\Facades\DB;
 use Tests\Support\TradingFixtures;
 use Tests\TestCase;
@@ -15,11 +15,12 @@ use Trading\Domain\Exception\TradingException;
  * propia conexión a MySQL, y todos arrancan a la vez tras una barrera de tiempo.
  *
  * No se puede usar RefreshDatabase: sus datos viven en una transacción sin
- * confirmar que los otros procesos no verían. Por eso se migra la BD en cada test.
+ * confirmar que los otros procesos no verían. Por eso se migra una vez por
+ * ejecución y se vacían las tablas antes de cada test (DatabaseTruncation).
  */
 abstract class ConcurrencyTestCase extends TestCase
 {
-    use DatabaseMigrations;
+    use DatabaseTruncation;
     use TradingFixtures;
 
     protected function setUp(): void

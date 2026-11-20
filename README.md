@@ -6,7 +6,7 @@ API en Laravel 13 + MySQL para intercambiar cromos repetidos entre usuarios, con
 
 ```bash
 docker compose up --build          # API + demo en :8000, websockets en :8081
-docker compose exec app php artisan test                      # 78 tests (unit, feature y concurrencia)
+docker compose exec app php artisan test                      # 79 tests (unit, feature y concurrencia)
 docker compose exec app php artisan test --testsuite=Concurrency
 docker compose exec app php artisan trading:race              # script de concurrencia por HTTP (--keep para no limpiar)
 ```
@@ -98,12 +98,15 @@ Para saber que estos tests detectan algo, se quitaron los `FOR UPDATE` y se ejec
 
 ## Fuera de alcance / con más tiempo
 
-1. **Notificaciones persistentes.** El websocket solo llega si el autor está conectado; con la app cerrada, el aviso se pierde. Guardaría una tabla `notifications` (bandeja de entrada con leídas/no leídas) y enviaría push móvil (FCM/APNs) a quien no esté conectado. El websocket pasa a ser una vía de entrega, no la fuente de verdad.
-2. **Patrón outbox.** Hoy el intercambio se guarda y después se encola el aviso. Si el proceso muere justo entre los dos pasos, el intercambio queda hecho pero el aviso se pierde. Lo resolvería guardando el aviso en una tabla `outbox` dentro de la misma transacción que el intercambio, para que se guarden los dos o ninguno, y con un proceso aparte que envíe los pendientes. Un aviso podría llegar dos veces, así que el cliente debe ignorar los repetidos (por `offer_id`).
-3. **Idempotencia en aceptar y publicar.** Con una mala conexión un `publish` repetido crea dos ofertas y un `accept` repetido devuelve un 409 confuso aunque el primero saliera bien. Con una cabecera `Idempotency-Key` guardada junto a su respuesta, un reintento devuelve el resultado original.
-4. **Arquitectura protegida por herramientas.** PHPStan a nivel máximo y una regla de arquitectura (Deptrac o tests de arquitectura) que falle si `Domain` importa `Illuminate`, todo en CI con MySQL. Hoy la separación de capas depende de la disciplina.
-5. **Contrato de API y de eventos / Documentación extra.** OpenAPI de la API y payloads de websocket versionados (`offer.accepted` v1), para que el backend evolucione sin romperse.
-6. **Seguridad: autenticación real.** Sustituir la cabecera `X-User-Id` por tokens (Sanctum, o el proveedor de identidad de la app móvil). Es un cambio localizado: el resto del código solo usa `$request->user()`, y la autorización de los canales privados de Reverb reutiliza el mismo guard.
+1. **Avisos que no se pierden: notificaciones persistentes guardadas en la misma transacción.** Hoy el aviso se pierde en dos casos:
+   - **El autor no está conectado.** El websocket solo llega a quien tiene la app abierta.
+   - **Falla el encolado, o el proceso muere justo después del commit.** El intercambio queda hecho y el aviso no llega. Hoy ese fallo se registra en el log y la aceptación responde 200 igualmente: no tiene sentido devolver un 500 de un intercambio que ya está guardado. Ese aviso no llega a `failed_jobs`, porque el job nunca se creó; ahí solo acaban los que se encolaron y fallaron al enviarse a Reverb.
+
+   Los dos se resuelven con lo mismo: una tabla `notifications` (bandeja de entrada con leídas y no leídas) en la que se guarda una fila por aviso **dentro de la misma transacción que el intercambio**. Guardarla es una escritura más del intercambio, como actualizar las copias, y esa fila hace a la vez de outbox y de bandeja de entrada. El envío va aparte y **nunca afecta al intercambio**: un worker manda las pendientes por websocket a quien esté conectado y por push móvil (FCM/APNs) a quien no. Si el envío falla (Reverb caído, push rechazado), el intercambio sigue hecho, la notificación queda pendiente y se reintenta, y en el peor caso el usuario la ve en la bandeja al abrir la app. El websocket pasa a ser una vía de entrega, no la fuente de verdad. Un aviso podría llegar dos veces, así que el cliente debe ignorar los repetidos (por id de notificación).
+2. **Idempotencia en aceptar y publicar.** Con una mala conexión un `publish` repetido crea dos ofertas y un `accept` repetido devuelve un 409 confuso aunque el primero saliera bien. Con una cabecera `Idempotency-Key` guardada junto a su respuesta, un reintento devuelve el resultado original.
+3. **Arquitectura protegida por herramientas.** PHPStan a nivel máximo y una regla de arquitectura (Deptrac o tests de arquitectura) que falle si `Domain` importa `Illuminate`, todo en CI con MySQL. Hoy la separación de capas depende de la disciplina.
+4. **Contrato de API y de eventos / Documentación extra.** OpenAPI de la API y payloads de websocket versionados (`offer.accepted` v1), para que el backend evolucione sin romperse.
+5. **Seguridad: autenticación real.** Sustituir la cabecera `X-User-Id` por tokens (Sanctum, o el proveedor de identidad de la app móvil). Es un cambio localizado: el resto del código solo usa `$request->user()`, y la autorización de los canales privados de Reverb reutiliza el mismo guard.
 
 ## Para producción con mucho tráfico
 

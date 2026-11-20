@@ -4,11 +4,15 @@ declare(strict_types=1);
 
 namespace Tests\Feature\Trading;
 
+use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Exceptions;
 use PHPUnit\Framework\Attributes\Test;
+use Shared\Application\EventPublisher;
 use Tests\Support\TradingFixtures;
 use Tests\TestCase;
+use Trading\Infrastructure\Broadcasting\LaravelEventPublisher;
 use Trading\Infrastructure\Broadcasting\OfferAcceptedNotification;
 
 final class AcceptOfferTest extends TestCase
@@ -51,6 +55,26 @@ final class AcceptOfferTest extends TestCase
         $this->assertSame(['quantity' => 1, 'reserved' => 0], $this->holding($this->ana, $this->pedri));
         $this->assertSame(['quantity' => 1, 'reserved' => 0], $this->holding($this->bruno, $this->pedri));
         $this->assertSame(['quantity' => 1, 'reserved' => 0], $this->holding($this->bruno, $this->messi));
+    }
+
+    #[Test]
+    public function if_queueing_the_notification_fails_the_trade_still_succeeds_and_the_error_is_reported(): void
+    {
+        Exceptions::fake();
+        $queueDown = \Mockery::mock(Dispatcher::class);
+        $queueDown->shouldReceive('dispatch')->andThrow(new \RuntimeException('Cola caída'));
+        $this->app->instance(EventPublisher::class, new LaravelEventPublisher($queueDown));
+
+        $this->giveStickers($this->ana, $this->messi, 2);
+        $this->giveStickers($this->bruno, $this->pedri, 2);
+        $offerId = $this->publishAnaOffer();
+
+        $this->postJson("/api/offers/{$offerId}/accept", [], $this->as($this->bruno))
+            ->assertOk()
+            ->assertJsonPath('data.status', 'accepted');
+
+        $this->assertSame(['quantity' => 1, 'reserved' => 0], $this->holding($this->bruno, $this->messi));
+        Exceptions::assertReported(fn (\RuntimeException $e) => $e->getMessage() === 'Cola caída');
     }
 
     #[Test]

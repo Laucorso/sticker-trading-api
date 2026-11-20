@@ -2,26 +2,39 @@
 
 API en Laravel 13 + MySQL para intercambiar cromos repetidos entre usuarios, con aviso en tiempo real (Reverb) y caducidad asíncrona.
 
+**En 30 segundos**
+
+- **Concurrencia:** bloqueo pesimista con orden fijo. El autor se bloquea en modo compartido y una oferta disputada responde `offer_busy` al momento en vez de hacer cola. Probado con procesos reales en paralelo: sin locks, los tests fallan.
+- **Tiempo real:** Reverb con canal privado por usuario; el aviso se encola después del commit.
+- **Caducidad:** `expires_at` manda; un barrido cada minuto libera las copias reservadas.
+- **Arranque:** `docker compose up --build` y `php artisan test` (79 tests).
+
 ## Cómo ejecutarlo
 
 ```bash
-docker compose up --build          # API + demo en :8000, websockets en :8081
-docker compose exec app php artisan test                      # 79 tests (unit, feature y concurrencia)
+docker compose up --build                                        # API + demo en :8000, websockets en :8081
+docker compose exec app php artisan test                         # 79 tests (unit, feature y concurrencia)
 docker compose exec app php artisan test --testsuite=Concurrency
-docker compose exec app php artisan trading:race              # script de concurrencia por HTTP (--keep para no limpiar)
+docker compose exec app php artisan trading:race                 # concurrencia por HTTP (--keep para no limpiar)
 ```
 
 **Demo:** abre `http://localhost:8000/demo?user=1` y `http://localhost:8000/demo?user=2`. El usuario 1 publica «#01 Portero a cambio de #02 Defensa», el 2 la acepta y al 1 le aparece el aviso al momento.
 
-Servicios: `mysql`, `app` (API, migra y siembra al arrancar), `queue` (envía los avisos), `scheduler` (caducidad cada minuto) y `reverb` (websockets). Reverb escucha en el 8080 dentro de la red de Docker y se publica en el **8081** del host, porque el 8080 suele estar ocupado en Windows; el navegador lo toma de `REVERB_PUBLIC_PORT`.
+| Servicio | Qué hace |
+|---|---|
+| `mysql` | Base de datos (`trading` y `trading_test`) |
+| `app` | API y demo en `:8000`; migra y siembra al arrancar |
+| `queue` | Envía los avisos fuera de la petición |
+| `scheduler` | Caduca las ofertas vencidas cada minuto |
+| `reverb` | Websockets en `:8081` del host (el 8080 suele estar ocupado en Windows) |
 
-### API
+## API
 
-Autenticación simulada: cabecera `X-User-Id`.
+Autenticación simulada con la cabecera `X-User-Id`.
 
 | Método | Ruta | |
 |---|---|---|
-| GET | `/api/offers?offered_sticker_id=&requested_sticker_id=&author_id=&per_page=&cursor=` | Ofertas abiertas (paginación por cursor, `per_page` 1–100, 20 por defecto) |
+| GET | `/api/offers?offered_sticker_id=&requested_sticker_id=&author_id=&per_page=&cursor=` | Ofertas abiertas (cursor, `per_page` 1–100, 20 por defecto) |
 | POST | `/api/offers` `{offered_sticker_id, requested_sticker_id}` | Publicar |
 | POST | `/api/offers/{id}/accept` | Aceptar |
 | POST | `/api/offers/{id}/withdraw` | Retirar |
@@ -29,8 +42,9 @@ Autenticación simulada: cabecera `X-User-Id`.
 | GET | `/api/users/{id}/collection` | Colección (`quantity`, `reserved`, `tradeable`) |
 | GET | `/api/stickers` | Catálogo |
 
-- Los errores de negocio devuelven `{"error": "<code>", "message": "..."}` con un código estable: `no_spare_copy`, `offer_not_open`, `offer_busy`, `offer_expired`, `weekly_trade_limit_reached`, `cannot_accept_own_offer`, `not_offer_author`, `account_deleted`... (409 por defecto; 404, 403 o 422 donde corresponde). Los errores de forma (campos que faltan, tipos, cromos inexistentes) los validan las FormRequest y devuelven el 422 estándar de Laravel.
-- Las escrituras (publicar, aceptar, retirar y `DELETE /api/me`) tienen un límite de 60 peticiones por minuto por usuario, para que un cliente en bucle no convierta su fila de `users` en un punto caliente de locks. Al superarlo se devuelve 429 con `Retry-After` y el formato de Laravel (`{"message": "Too Many Attempts."}`), sin el campo `error`. Por eso `trading:race` con `--requests` mayor que 60 recibiría 429 en el escenario 2, donde un mismo usuario acepta todas las ofertas.
+- **Errores de negocio:** `{"error": "<code>", "message": "..."}` con un código estable (`no_spare_copy`, `offer_not_open`, `offer_busy`, `offer_expired`, `weekly_trade_limit_reached`, `cannot_accept_own_offer`, `not_offer_author`, `account_deleted`…). 409 por defecto; 404, 403 o 422 donde corresponde.
+- **Errores de validación:** los validan las FormRequest (422 estándar de Laravel).
+- **Rate limiting:** 60 escrituras por minuto y usuario (429 con `Retry-After`). Evita que un cliente en bucle convierta su fila en un punto caliente de locks. Las lecturas no tienen límite.
 
 ## Arquitectura
 
@@ -42,53 +56,98 @@ src/Trading/
 src/Shared/        Clock, TransactionManager, EventPublisher
 ```
 
-- Hexagonal ligera: las reglas viven en el dominio y se prueban sin BD; los casos de uso orquestan; Laravel solo aparece en los adaptadores: las FormRequest validan la forma y traducen la petición a primitivos o a un DTO (`ListOffersRequest::toQuery()` → `OpenOffersQuery`), y el controlador solo delega. El lado de lectura (listado, colección) va directo a SQL por un read model, porque leer no aplica reglas.
+- **Hexagonal ligera:** las reglas viven en el dominio y se prueban sin base de datos; los casos de uso orquestan; Laravel solo aparece en los adaptadores.
+- **Controladores finos:** las FormRequest validan y traducen la petición a primitivos o a un DTO (`ListOffersRequest::toQuery()` → `OpenOffersQuery`).
+- **CQRS ligero:** las lecturas (listado y colección) van directas a SQL por un read model, porque leer no aplica reglas.
 
 ## Decisiones
 
-**1. Concurrencia con bloqueo pesimista y orden fijo.** Cada caso de uso abre una transacción y bloquea con `SELECT … FOR UPDATE`, siempre en el mismo orden: **oferta → usuarios implicados (por id)**.
+### 1. Concurrencia: bloqueo pesimista con orden fijo
 
-- Varios usuarios aceptan la misma oferta: al aceptar, la oferta se bloquea con `FOR UPDATE NOWAIT`. Quien llega mientras otro la procesa recibe al momento un 409 `offer_busy` en vez de hacer cola (en un pico sobre una sola oferta, la cola acababa en timeout y en 500 tras los reintentos); quien llega después del commit la ve aceptada (`offer_not_open`). No es una regla de negocio sino de concurrencia, pero usa el mismo contrato de error para que el cliente pueda reintentar. Retirar, caducar y borrar la cuenta sí esperan al lock: no deben fallar por una aceptación en curso.
-- El mismo usuario acepta varias a la vez: espera a su propio lock y, al entrar, ve sus copias ya descontadas (`no_spare_copy`).
-- La misma pareja intercambia a la vez, en cualquier sentido: el lock de los dos usuarios serializa el conteo semanal.
-- Muchos usuarios aceptan a la vez ofertas distintas del mismo autor: al aceptar, el autor se bloquea en **modo compartido** (`FOR SHARE`) y quien acepta en exclusiva. Los locks compartidos no se esperan entre sí, así que no hacen cola en la fila del autor; solo coinciden en sus filas de `user_stickers` cuando tocan el mismo cromo, y esas se bloquean por orden de cromo. El límite semanal sigue serializado: si A acepta una oferta de B mientras B acepta una de A, el exclusivo de cada uno choca con el compartido del otro.
-- Un usuario borra su cuenta mientras le aceptan una oferta: el borrado bloquea primero sus ofertas y después al usuario, así que gana quien coja antes el lock de la oferta (ver «Borrado de cuenta»).
+Cada caso de uso abre una transacción y bloquea antes de leer, siempre en el mismo orden: **oferta → usuarios (por id) → copias (por cromo)**.
 
-La fila de `users` hace de mutex por usuario porque siempre existe. Además, cada fila de `user_stickers` que se va a modificar se bloquea; si es un cromo que el usuario aún no tiene, se crea vacía y se bloquea en el mismo paso (`INSERT … ON DUPLICATE KEY UPDATE`), para que dos aceptaciones que le dan el mismo cromo nuevo no pierdan una copia. El orden fijo evita deadlocks y, si MySQL detecta uno igualmente, la transacción se reintenta (3 intentos). MySQL corre con `innodb_lock_wait_timeout=3` (por defecto son 50 s) para que, bajo contención, un worker no se quede bloqueado esperando: una espera de más de 3 s también se reintenta como un deadlock y, si fallan los 3 intentos, la petición devuelve un 500 en vez de un código de negocio. Al aceptar esto ya no pasa por la oferta (no espera, ver arriba); sí puede pasar por la fila de un usuario o de un cromo muy disputados.
+| Carrera | Cómo se resuelve | El perdedor recibe |
+|---|---|---|
+| Varios aceptan la misma oferta | La oferta se bloquea con `FOR UPDATE NOWAIT`: quien llega mientras otro la procesa no hace cola | `offer_busy` (llegó durante) u `offer_not_open` (llegó después) |
+| Un usuario acepta varias a la vez | Espera a su propio lock y ve sus copias ya descontadas | `no_spare_copy` |
+| La misma pareja intercambia a la vez, en cualquier sentido | Los locks de los dos usuarios chocan y el conteo semanal se serializa | `weekly_trade_limit_reached` |
+| Muchos aceptan ofertas distintas del mismo autor | El autor se bloquea en **compartido** y quien acepta en exclusiva: no hacen cola en el autor, solo en una misma fila de copias | Nada: todos salen |
+| Se borra la cuenta mientras le aceptan una oferta | El borrado bloquea primero sus ofertas: gana quien coja antes el lock de la oferta | Si gana el borrado, la aceptación recibe `offer_busy` u `offer_not_open` |
 
-*Descartado:* **optimistic locking** con versión (en una oferta disputada fallarían casi todos y habría que reintentar), **UPDATE condicional atómico** (`… WHERE quantity - reserved >= 2`, muy rápido, pero reparte las reglas entre SQL y PHP y no resuelve el límite semanal) y **locks en Redis** (una pieza más que puede fallar y que no es transaccional con la BD).
+**Detalles que lo hacen funcionar:**
 
-**2. Reservas como contador.** `user_stickers.reserved` cuenta las copias comprometidas en ofertas abiertas. Comprobar «tiene repetidas libres» es O(1) y la BD lo refuerza con `CHECK (reserved < quantity OR (quantity = 0 AND reserved = 0))`. El CHECK es una red de seguridad, no el mecanismo: sin locks se producen lost updates que el CHECK no ve (ver «Tests»).
+- **La fila de `users` hace de mutex por usuario**, porque siempre existe.
+- **Cada fila de copias que cambia se bloquea.** Si es un cromo que el usuario aún no tiene, `INSERT … ON DUPLICATE KEY UPDATE` la crea y la bloquea en el mismo paso, para no perder una copia.
+- **`NOWAIT` solo al aceptar.** Retirar, caducar y borrar la cuenta esperan el lock normal, porque deben completarse.
+- **Deadlocks:** el orden fijo los evita; si MySQL detecta uno, la transacción se reintenta (3 intentos).
+- **Timeout de lock de 3 s** (`innodb_lock_wait_timeout`, 50 s por defecto): un worker no se queda bloqueado bajo contención. Si fallan los 3 reintentos, la petición devuelve 500.
 
-**3. `READ COMMITTED`.** Tras bloquear, los casos de uso leen con SELECT normales. Con este aislamiento cada lectura ve lo último confirmado por quien tuvo el lock antes, sin depender de cuándo abre InnoDB el snapshot de `REPEATABLE READ`. Además evita gap locks.
+*Descartado:*
 
-**4. Caducidad: `expires_at` manda y un barrido limpia.** Una oferta con más de 48 h no se puede aceptar ni aparece en el listado aunque el job no haya pasado. `offers:expire` corre cada minuto (`withoutOverlapping` + `onOneServer`), caduca en transacciones cortas e idempotentes y libera el cromo. *Descartado:* un job retrasado por oferta (SQS no admite más de 15 min de retraso, miles de jobs pendientes y hay que cancelarlos al retirar) y eventos de MySQL (lógica fuera del código y de los tests).
+- **Bloqueo optimista:** en una oferta disputada fallarían casi todos y habría que reintentar.
+- **UPDATE condicional** (`… WHERE quantity - reserved >= 2`): muy rápido, pero reparte las reglas entre SQL y PHP y no resuelve el límite semanal.
+- **Locks en Redis:** una pieza más que puede fallar y que no es transaccional con la base de datos.
 
-**5. Tiempo real con Reverb y canal privado.** Al aceptar se publica `OfferAccepted` **después del commit** y se encola `OfferAcceptedNotification` (`ShouldBroadcast`) al canal `private-users.{autorId}`. El worker lo envía a Reverb, así que un Reverb caído no rompe la aceptación y el envío se reintenta. El canal se autoriza con la misma cabecera, y nadie puede escuchar el canal de otro. *Descartado:* SSE (cada conexión abierta ocupa un worker PHP). Reverb usa el protocolo de Pusher, así que pasar a un gateway propio en NestJS o a Pusher/Ably es cambiar el driver.
+### 2. Reservas como contador
 
-**6. Tests contra MySQL real, no SQLite.** Los locks y los CHECK son parte de lo que se prueba; SQLite ignora `FOR UPDATE`.
+`user_stickers.reserved` cuenta las copias comprometidas en ofertas abiertas. Comprobar «tiene repetidas libres» es O(1), y la base de datos lo refuerza con `CHECK (reserved < quantity OR (quantity = 0 AND reserved = 0))`. El `CHECK` es una red de seguridad, no el mecanismo: sin locks hay *lost updates* que no ve.
+
+### 3. `READ COMMITTED`
+
+Tras bloquear, los casos de uso leen con `SELECT` normales. Con este aislamiento, cada lectura ve lo último confirmado por quien tuvo el lock antes, sin depender de cuándo abre InnoDB el snapshot de `REPEATABLE READ`. Además, evita gap locks.
+
+### 4. Caducidad: `expires_at` manda y un barrido limpia
+
+Una oferta con más de 48 h no se puede aceptar ni aparece en el listado, aunque el barrido no haya pasado. `offers:expire` corre cada minuto (`withoutOverlapping` + `onOneServer`), en transacciones cortas e idempotentes, y libera la copia.
+
+*Descartado:* un job retrasado por oferta (SQS no admite más de 15 min, miles de jobs pendientes que habría que cancelar al retirar) y eventos programados de MySQL (lógica fuera del código y de los tests).
+
+### 5. Tiempo real con Reverb y canal privado
+
+Al aceptar se publica `OfferAccepted` **después del commit** y se encola `OfferAcceptedNotification` (`ShouldBroadcast`) al canal `private-users.{autorId}`.
+
+- **Después del commit:** sin avisos falsos si hay rollback.
+- **Encolado:** si Reverb cae, la aceptación no falla y el envío se reintenta.
+- **Canal privado:** se autoriza con la misma cabecera, y nadie puede escuchar el canal de otro.
+
+*Descartado:* SSE (en PHP cada conexión abierta ocupa un worker). Reverb habla el protocolo de Pusher, así que pasar a Pusher, Ably o un gateway propio en NestJS es cambiar el driver.
+
+### 6. Tests contra MySQL real, no SQLite
+
+Los locks y los `CHECK` son parte de lo que se prueba, y SQLite ignora `FOR UPDATE`.
 
 ## Suposiciones
 
-- **Repetido** = cualquier copia más allá de la primera. Con 3 copias se pueden tener 2 ofertas abiertas del mismo cromo.
-- Quien acepta también entrega un repetido: no puede dar su última copia ni una comprometida en otra oferta suya.
+- **Repetido** = cualquier copia más allá de la primera. Cada oferta abierta reserva una: con 3 copias se pueden tener 2 ofertas abiertas del mismo cromo.
+- **Quien acepta** también entrega un repetido: no puede dar su última copia ni una comprometida en otra oferta suya.
 - Se puede pedir un cromo que ya tienes; no se puede ofrecer y pedir el mismo.
 - **Semana** = ventana móvil de 7 días, no semana natural (si no, se podrían hacer 5 el domingo y 5 el lunes). Cuentan los intercambios en los dos sentidos de la pareja.
-- **Caducidad** = Retirar una oferta vencida que el barrido aún no ha procesado devuelve `offer_expired`; el barrido libera el cromo en menos de un minuto.
-- La oferta caduca exactamente a las 48 h (`expires_at`), pero el cromo se libera en el barrido, como mucho un minuto después. Para hacerlo exacto, los casos de uso caducarían las ofertas vencidas del usuario antes de comprobar sus copias.
+- **Caducidad:** la oferta caduca exactamente a las 48 h, pero la copia se libera en el barrido, como mucho un minuto después. Retirar una oferta vencida que el barrido aún no ha procesado devuelve `offer_expired`.
 - Un intercambio aceptado es definitivo.
-- Cualquier usuario puede ver la colección de otro, para saber quién tiene repetido el cromo que busca antes de publicar su oferta.
-- **Borrado de cuenta** (`DELETE /api/me`) = no se borra la fila, se anonimiza (nombre, email y contraseña) y se marca con `deleted_at`, para que la otra parte conserve su historial de intercambios; la FK `restrict` de `offers` impide además un borrado físico accidental. En la misma transacción se retiran sus ofertas abiertas liberando las reservas (las vencidas que el barrido aún no ha procesado se marcan como caducadas). Respeta el orden de bloqueo **ofertas → usuario**: si alguien acepta a la vez, gana quien coja antes el lock de la oferta. Con el lock del usuario se relee, para recoger ofertas publicadas mientras tanto. `PublishOffer` y `AcceptOffer` comprueban, ya con el lock del usuario, que ninguna cuenta implicada esté borrada (`account_deleted`); por HTTP una cuenta borrada ya ni se autentica. Su colección se conserva tal cual. No se envían avisos al autor borrado.
+- Cualquier usuario puede ver la colección de otro, para saber quién tiene repetido el cromo que busca antes de publicar.
+- **Borrado de cuenta:** no se borra la fila; se anonimiza (nombre, email y contraseña) y se marca con `deleted_at`, para que la otra parte conserve su historial. En la misma transacción se retiran sus ofertas abiertas y se liberan las reservas. `PublishOffer` y `AcceptOffer` comprueban, con el lock del usuario, que ninguna cuenta implicada esté borrada. Su colección se conserva y no se envían avisos al autor borrado.
 
 ## Tests
 
-- **Unit** (dominio, sin BD): ciclo de vida de la oferta e invariantes del VO inmutable `Copies` y de `StickerHolding`.
+- **Unit** (dominio, sin BD): ciclo de vida de la oferta e invariantes de `Copies` y `StickerHolding`.
 - **Feature** (HTTP + MySQL): cada regla de negocio, caducidad con `travel()`, aviso en el canal correcto y que no se emite si la operación falla.
-- **Concurrencia** (`tests/Concurrency`): cada operación en un proceso hijo (`pcntl_fork`) con su propia conexión, todos arrancando tras una barrera de tiempo. Escenarios: 20 usuarios aceptando la misma oferta (gana uno; el resto recibe `offer_busy` u `offer_not_open`), aceptar una oferta que otra transacción tiene bloqueada (`offer_busy` al momento, sin esperar), un usuario con una repetida aceptando 10, 10 intercambios simultáneos de la misma pareja (también en los dos sentidos a la vez), 30 usuarios aceptando a la vez 30 ofertas distintas del mismo autor (todas salen y el autor no pierde ni gana copias), 10 publicaciones con la misma repetida, aceptar y retirar a la vez, aceptar una oferta mientras su autor borra la cuenta (o queda aceptada, o retirada con el cromo liberado) y publicar mientras se borra la cuenta (nunca queda una oferta abierta de una cuenta borrada). Además de quién gana, se comprueba que no se crean ni se destruyen cromos.
+- **Concurrencia** (`tests/Concurrency`): cada operación en un proceso hijo (`pcntl_fork`) con su propia conexión, todos arrancando a la vez tras una barrera. Además de quién gana, se comprueba que no se crean ni se destruyen cromos.
 
-Para saber que estos tests detectan algo, se quitaron los `FOR UPDATE` y se ejecutaron: **los 5 escenarios originales fallan** (8 usuarios «ganaban» la misma oferta, la pareja hacía 10 intercambios en una semana, la misma repetida respaldaba 3 ofertas…).
+| Escenario | Resultado esperado |
+|---|---|
+| 20 usuarios aceptan la misma oferta | Gana uno; el resto, `offer_busy` u `offer_not_open` |
+| Aceptar una oferta que otra transacción tiene bloqueada | `offer_busy` al momento, sin esperar |
+| Un usuario con una sola repetida acepta 10 ofertas | Gana una; el resto, `no_spare_copy` |
+| 10 intercambios simultáneos de la misma pareja (también en los dos sentidos) | 5 salen; el resto, `weekly_trade_limit_reached` |
+| 30 usuarios aceptan 30 ofertas distintas del mismo autor | Salen todas y el autor no pierde ni gana copias |
+| 10 publicaciones con la misma repetida | Solo una reserva la copia |
+| Aceptar y retirar a la vez | Gana solo una de las dos |
+| Aceptar mientras el autor borra la cuenta | O queda aceptada, o retirada con la copia liberada |
+| Publicar mientras se borra la cuenta | Nunca queda una oferta abierta de una cuenta borrada |
 
-`trading:race` hace lo mismo por HTTP contra la API levantada (25 peticiones simultáneas con curl multi). Crea sus propios usuarios y al terminar retira, con `WithdrawOffer`, las ofertas que quedaron sin aceptar, para no ensuciar la demo (`--keep` las conserva). En el escenario 1, los 409 se reparten entre `offer_busy` (llegaron mientras el ganador procesaba la oferta) y `offer_not_open` (llegaron después); la tabla es de antes de NOWAIT:
+**Para saber que detectan algo,** se quitaron los `FOR UPDATE` y se ejecutaron: los 5 escenarios originales fallan (8 usuarios «ganaban» la misma oferta, la pareja hacía 10 intercambios en una semana, la misma repetida respaldaba 3 ofertas…).
+
+**`trading:race`** hace lo mismo por HTTP contra la API levantada (25 peticiones simultáneas). Crea sus propios usuarios y al terminar retira las ofertas sin aceptar, para no ensuciar la demo (`--keep` las conserva). Resultado de antes de `NOWAIT`; ahora, en el escenario 1, los 24 perdedores se reparten entre `offer_busy` y `offer_not_open`:
 
 ```
 1) 25 usuarios aceptan la oferta #1          2) Un usuario con 1 repetida acepta 25 ofertas
@@ -98,40 +157,36 @@ Para saber que estos tests detectan algo, se quitaron los `FOR UPDATE` y se ejec
 
 ## Fuera de alcance / con más tiempo
 
-1. **Avisos que no se pierden: notificaciones persistentes guardadas en la misma transacción.** Hoy el aviso se pierde en dos casos:
-   - **El autor no está conectado.** El websocket solo llega a quien tiene la app abierta.
-   - **Falla el encolado, o el proceso muere justo después del commit.** El intercambio queda hecho y el aviso no llega. Hoy ese fallo se registra en el log y la aceptación responde 200 igualmente: no tiene sentido devolver un 500 de un intercambio que ya está guardado. Ese aviso no llega a `failed_jobs`, porque el job nunca se creó; ahí solo acaban los que se encolaron y fallaron al enviarse a Reverb.
-
-   Los dos se resuelven con lo mismo: una tabla `notifications` (bandeja de entrada con leídas y no leídas) en la que se guarda una fila por aviso **dentro de la misma transacción que el intercambio**. Guardarla es una escritura más del intercambio, como actualizar las copias, y esa fila hace a la vez de outbox y de bandeja de entrada. El envío va aparte y **nunca afecta al intercambio**: un worker manda las pendientes por websocket a quien esté conectado y por push móvil (FCM/APNs) a quien no. Si el envío falla (Reverb caído, push rechazado), el intercambio sigue hecho, la notificación queda pendiente y se reintenta, y en el peor caso el usuario la ve en la bandeja al abrir la app. El websocket pasa a ser una vía de entrega, no la fuente de verdad. Un aviso podría llegar dos veces, así que el cliente debe ignorar los repetidos (por id de notificación).
-2. **Idempotencia en aceptar y publicar.** Con una mala conexión un `publish` repetido crea dos ofertas y un `accept` repetido devuelve un 409 confuso aunque el primero saliera bien. Con una cabecera `Idempotency-Key` guardada junto a su respuesta, un reintento devuelve el resultado original.
-3. **Arquitectura protegida por herramientas.** PHPStan a nivel máximo y una regla de arquitectura (Deptrac o tests de arquitectura) que falle si `Domain` importa `Illuminate`, todo en CI con MySQL. Hoy la separación de capas depende de la disciplina.
-4. **Contrato de API y de eventos / Documentación extra.** OpenAPI de la API y payloads de websocket versionados (`offer.accepted` v1), para que el backend evolucione sin romperse.
-5. **Seguridad: autenticación real.** Sustituir la cabecera `X-User-Id` por tokens (Sanctum, o el proveedor de identidad de la app móvil). Es un cambio localizado: el resto del código solo usa `$request->user()`, y la autorización de los canales privados de Reverb reutiliza el mismo guard.
+1. **Avisos que no se pierden.** Hoy se pierde un aviso si el autor no está conectado, si falla el encolado (se registra en el log y la aceptación responde 200 igualmente) o si el proceso muere justo después del commit. Los tres casos se resuelven con una tabla `notifications` escrita **en la misma transacción** que el intercambio: hace de outbox y de bandeja de entrada. Un worker envía las pendientes por websocket o push móvil (FCM/APNs) y reintenta si falla, sin afectar nunca al intercambio. El cliente ignora los avisos repetidos por id.
+2. **Idempotencia en aceptar y publicar.** Con mala conexión, un `publish` repetido crea dos ofertas y un `accept` repetido devuelve un 409 confuso aunque el primero saliera bien. Una cabecera `Idempotency-Key` guardada con su respuesta haría que el reintento devuelva el resultado original.
+3. **Arquitectura protegida por herramientas.** PHPStan a nivel máximo y una regla de arquitectura (Deptrac o tests) que falle si `Domain` importa `Illuminate`, todo en CI con MySQL.
+4. **Contrato de API y de eventos.** OpenAPI y payloads de websocket versionados (`offer.accepted` v1).
+5. **Autenticación real.** Sustituir `X-User-Id` por tokens (Sanctum o el proveedor de identidad de la app). Es un cambio localizado: el resto del código solo usa `$request->user()`, y los canales de Reverb reutilizan el mismo guard.
 
 ## Para producción con mucho tráfico
 
-- **Runtime en AWS:** nginx + PHP-FPM u Octane detrás de un balanceador, con web, workers y scheduler como servicios separados que escalan por separado (ECS). Colas en SQS (o Redis con Horizon) y Reverb en varias réplicas con Redis pub/sub (ElastiCache).
-- **Contención y locks:** el lock es por fila, así que el volumen general no le afecta; el riesgo son las filas calientes: una oferta muy disputada o un usuario muy activo. Las aceptaciones de ofertas de un autor popular ya no hacen cola en su fila (lock compartido), pero sí en la de un mismo cromo suyo: si un autor publica muchas ofertas del mismo cromo, las aceptaciones se serializan en esa fila durante el final de cada transacción. Si las métricas lo mostraran como punto caliente, el siguiente paso sería guardar las copias con incrementos relativos (`quantity = quantity - 1`) en vez de leer y escribir. Una oferta muy disputada ya no hace cola: se acepta con `FOR UPDATE NOWAIT` y quien llega mientras otro la procesa recibe `offer_busy` al momento.
-- **Base de datos:** Aurora MySQL con **RDS Proxy**: cientos de workers PHP con conexiones propias agotan las de MySQL en un pico. Listado y colección desde réplicas con caché corta; tras escribir se lee de la primaria (`'sticky' => true`) para que el usuario vea su propio cambio.
-- **Crecimiento de datos:** `offers` acumula ofertas cerradas y el camino crítico solo necesita las abiertas. Archivaría o particionaría las cerradas, sacaría el historial a una tabla `trades` con índice por pareja y fecha (el conteo semanal sigue siendo barato y mantiene la ventana móvil), y haría el barrido de caducadas en lotes con `FOR UPDATE SKIP LOCKED` y varios workers.
-- **Observabilidad y validación:** Sentry para errores; Horizon para las colas y Laravel Pulse con los recolectores de Reverb para los websockets (conexiones activas, mensajes). Métricas de esperas de lock, deadlocks, reintentos, tamaño de cola y latencia del aviso (aceptación → entrega), con alertas; logs correlados por `offer_id`. Antes de un lanzamiento, pruebas de carga (k6) con escenarios de contención real, como miles de usuarios sobre las mismas ofertas, y no solo de volumen.
+- **Runtime en AWS:** nginx + PHP-FPM u Octane detrás de un balanceador; web, workers y scheduler como servicios que escalan por separado (ECS). Colas en SQS (o Redis con Horizon) y Reverb en varias réplicas con Redis pub/sub (ElastiCache).
+- **Contención:** el lock es por fila, así que el volumen general no le afecta; el riesgo son las filas calientes. La oferta disputada ya no hace cola (`NOWAIT`) y las aceptaciones a un autor popular ya no esperan en su fila (lock compartido). Solo esperan las que tocan el mismo cromo del autor: esa cola es inherente, porque compiten por las mismas copias, y es corta, porque las copias se bloquean al final de la transacción.
+- **Base de datos:** Aurora MySQL con **RDS Proxy**, porque cientos de workers PHP con conexiones propias agotan las de MySQL en un pico. Listado y colección desde réplicas con caché corta; tras escribir, lectura de la primaria (`'sticky' => true`).
+- **Crecimiento de datos:** archivar o particionar las ofertas cerradas; historial en una tabla `trades` con índice por pareja y fecha (conteo semanal barato, ventana móvil intacta); barrido en lotes con `FOR UPDATE SKIP LOCKED` y varios workers.
+- **Observabilidad:** Sentry para errores, Horizon para las colas y Laravel Pulse con los recolectores de Reverb. Métricas de esperas de lock, deadlocks, reintentos, `offer_busy`, 429 y latencia del aviso, con alertas. Antes de un lanzamiento, pruebas de carga (k6) con contención real, no solo de volumen.
 
 ## Uso de la IA
 
 He trabajado con Claude como pareja de programación, por pasos pequeños y con un commit por paso:
 
 1. **Enfoque primero:** a partir del enunciado fijé la arquitectura (hexagonal ligera), la estrategia de concurrencia (bloqueo pesimista con orden fijo) y el tiempo real (Reverb con cola) antes de generar código.
-2. **Construcción por capas:** dominio, casos de uso, infraestructura, API, tiempo real y Docker, en ese orden. La IA generaba el código y los tests de cada capa; revisando el diff antes de seguir.
+2. **Construcción por capas:** dominio, casos de uso, infraestructura, API, tiempo real y Docker. La IA generaba el código y los tests de cada capa, y yo revisaba el diff antes de seguir.
 3. **Verificar, no confiar:** tests contra MySQL real, tests de concurrencia validados quitando los locks a propósito, y la primera ejecución real en Docker hecha por mí.
-4. **Ajustes propios:** después de la primera versión hice los refactors que se describen abajo (`Copies`, FormRequests, `OpenOffersQuery`, borrado de cuenta).
+4. **Ajustes propios:** después de la primera versión hice los cambios que se describen abajo.
 
 **Decisiones de diseño que revisé y ajusté**
 
-- **Lock compartido del autor al aceptar:** en la primera versión, aceptar bloqueaba en exclusiva a los dos usuarios. Si 30 personas aceptaban a la vez 30 ofertas distintas de un mismo autor, iban de una en una porque todas esperaban por la fila de ese autor, aunque cada una tocara cromos distintos. Ahora el autor se bloquea en modo compartido, que no hace esperar a otras aceptaciones, y lo que se bloquea en exclusiva son solo sus filas de copias que cambian. Así, las 30 aceptaciones van en paralelo y solo esperan entre sí las que tocan el mismo cromo del autor. Si el cromo que recibe todavía no tiene fila, `INSERT … ON DUPLICATE KEY UPDATE` la crea y la bloquea en el mismo paso, para que dos aceptaciones que le dan un cromo nuevo no pierdan una copia. Lo comprueba un test con 30 aceptaciones simultáneas al mismo autor.
-- **Aceptar sin hacer cola (`NOWAIT`):** en la primera versión, si muchas personas aceptaban la misma oferta a la vez, todas esperaban en cola por su fila aunque solo una podía ganar. Con miles a la vez, las últimas superaban el timeout del lock, se reintentaban ocupando un worker hasta unos 9 s y acababan en un 500. Ahora aceptar bloquea la oferta con `FOR UPDATE NOWAIT`: si otra petición ya la tiene, responde al momento con `409 offer_busy` en vez de esperar. El usuario sabe enseguida que alguien se le ha adelantado y no se ocupan workers esperando. Retirar, caducar y borrar la cuenta siguen esperando el lock normal, porque deben completarse.
-- **VO `Copies` inmutable:** la primera versión tenía la regla de copias dentro de `StickerHolding`, que es mutable. La extraje a un value object inmutable para que la regla central (no perder la última copia ni usar una reservada) viva en un solo sitio y cada operación devuelva un estado nuevo.
-- **VOs de identidad, descartados a propósito:** los ids son `int`. Valoré `UserId`, `StickerId` y `OfferId`, pero en un dominio tan pequeño añadían ceremonia en todas las capas sin ninguna regla nueva. Es lo primero que añadiría si el dominio creciera.
-- **DTOs solo donde aportan:** los casos de uso de escritura reciben entre uno y tres ids con argumentos con nombre, así que un command por caso de uso sería ceremonia. Sí agrupé los filtros del listado en `OpenOffersQuery`, que tiene cinco parámetros opcionales, y moví la validación HTTP a FormRequests para dejar los controladores finos.
-- **Varios agregados en una transacción:** `AcceptOffer` modifica la oferta y cuatro holdings a la vez, lo que rompe la regla de «un agregado por transacción». Lo mantuve porque el intercambio tiene que ser atómico; con consistencia eventual habría una ventana con un cromo entregado y el otro no.
-- **Puerto `Accounts` en vez de reutilizar `UserLock`:** para el borrado de cuenta, Trading necesita saber si una cuenta está borrada. No metí esa regla en el lock (mezclaría un mecanismo con una regla de negocio) ni creé un agregado `Account` sin invariantes: un puerto pequeño con lo que Trading usa.
-- **Sin Eloquent en el dominio:** las entidades son PHP puro y los repositorios mapean con query builder, para no tener dos modelos de la misma tabla y dejar los locks a la vista.
+- **Lock compartido del autor al aceptar:** antes se bloqueaba en exclusiva a los dos usuarios, así que 30 aceptaciones de ofertas distintas de un mismo autor iban de una en una sin competir. Ahora van en paralelo y solo esperan las que tocan el mismo cromo (ver «Decisiones», punto 1). Lo comprueba un test con 30 aceptaciones simultáneas.
+- **Aceptar sin hacer cola (`NOWAIT`):** antes, miles de aceptaciones sobre la misma oferta acababan en timeout y en 500 tras los reintentos. Ahora quien llega mientras otro la procesa recibe `offer_busy` al momento.
+- **VO `Copies` inmutable:** saqué la regla de copias de `StickerHolding`, que es mutable, para que viva en un solo sitio y cada operación devuelva un estado nuevo.
+- **VOs de identidad, descartados a propósito:** los ids son `int`. `UserId`, `StickerId` y `OfferId` añadían ceremonia sin ninguna regla nueva; es lo primero que añadiría si el dominio creciera.
+- **DTOs solo donde aportan:** los casos de uso reciben entre uno y tres ids con argumentos con nombre. Solo agrupé en `OpenOffersQuery` los cinco filtros opcionales del listado.
+- **Varios agregados en una transacción:** `AcceptOffer` modifica la oferta y cuatro holdings a la vez. Rompe la regla de «un agregado por transacción», pero el intercambio tiene que ser atómico.
+- **Puerto `Accounts`:** saber si una cuenta está borrada es una regla, no un mecanismo, así que no lo metí en `UserLock` ni creé un agregado `Account` sin invariantes.
+- **Sin Eloquent en el dominio:** entidades en PHP puro y repositorios con query builder, para no tener dos modelos de la misma tabla y dejar los locks a la vista.
